@@ -1,0 +1,1059 @@
+﻿
+
+float HashScale;
+float3 HashSize;
+float3 HashTranslate;
+
+RWStructuredBuffer<int2> IndexMap;
+RWStructuredBuffer<int2> Table;
+
+int3 HashIndex(float3 p)
+{
+	p = (p - HashTranslate) * HashScale;
+	return clamp(p, 0, HashSize - 1);
+}
+
+float KernelRadius;
+float KernelRadius2;
+float ParticleRadius;
+
+float Poly6Zero;
+float Poly6;
+float SpikyGrad;
+float ViscLap;
+
+float Pow2(float v)
+{
+	return v * v;
+}
+
+float Pow3(float v)
+{
+	return v * v * v;
+}
+
+float Poly6Kernel(float len2)
+{
+	return Poly6 * Pow3(KernelRadius2 - len2);
+}
+
+float3 SpikyGradKernel(float3 p, float len2)
+{
+	float r = sqrt(len2);
+	return (p / r) * SpikyGrad * Pow2(KernelRadius - r);
+}
+
+float ViscLapKernel(float len2)
+{
+	float r = sqrt(len2);
+	return ViscLap * (KernelRadius - r);
+}
+
+float3 Vec2Norm(float3 vec)
+{
+	float r = sqrt(Pow2(vec.x) + Pow2(vec.y) + Pow2(vec.z));
+	return vec / r;
+}
+
+float3x3 Matrix3x3Mul(float3x3 M1, float3x3 M2){
+	float3x3 R = {
+		0, 0, 0,
+		0, 0, 0,
+		0, 0, 0
+	};
+	for(int i = 0; i< 3; i++){
+		for(int j = 0; j < 3; j++){
+			for(int k = 0; k < 3; k++){
+				R[i][j] += M1[i][k] * M2[k][j];
+			}
+		}
+	}
+
+	return R;
+}
+
+float3 Matrix3x3MulFloat3(float3x3 M1, float3 F2)
+{
+	float3x3 R = {
+		0, 0, 0,
+		0, 0, 0,
+		0, 0, 0
+	};
+	float3 F = float3(0, 0, 0);
+	for(int i = 0; i < 3; i++){
+ 		for(int j = 0; j < 1;j++){
+    		for(int p = 0; p < 3; p++){
+    			R[i][j] += M1[i][p] * F2[p];
+			}     
+		}      
+	}
+	F.x = R[0][0];
+	F.y = R[1][0];
+	F.z = R[2][0];
+
+	return F;
+}
+
+#define THREADS 128
+#define PI 3.14159265359
+
+RWStructuredBuffer<float4> Positions;
+StructuredBuffer<float4> PredictedREAD;
+RWStructuredBuffer<float4> PredictedWRITE;
+StructuredBuffer<float4> VelocitiesREAD;
+RWStructuredBuffer<float4> VelocitiesWRITE;
+RWStructuredBuffer<float> Densities;
+RWStructuredBuffer<float> Pressures;
+
+StructuredBuffer<float4> Boundary;
+StructuredBuffer<float4> Extra;
+
+float3 Gravity;
+float Dampning;
+float DeltaTime;
+float Density;
+float Viscosity;
+float ParticleMass;
+int NumParticles;
+RWStructuredBuffer<float4> Core;
+
+float3 dxyz;
+
+int BoundaryParticles;
+int ExtraParticles;
+
+
+float3 Velocity(int i)
+{
+
+	float3 velocity = VelocitiesREAD[i].xyz;
+	velocity -= velocity * Dampning * DeltaTime;
+	velocity += DeltaTime * Gravity;
+
+	return velocity;
+}
+
+float3 PredictedPosition(int i, float3 velocity)
+{
+	return Positions[i].xyz + DeltaTime * velocity;
+}
+
+#pragma kernel PredictPositions
+
+[numthreads(THREADS,1,1)]
+void PredictPositions(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		float3 velocity = Velocity(id);
+		float3 predicted = PredictedPosition(id, velocity);
+
+		VelocitiesWRITE[id] = float4(velocity, 0);
+		PredictedWRITE[id] = float4(predicted, 0);
+	}
+
+}
+
+
+float Distance2(float3 a, float3 b)
+{
+	float3 ab = a - b;
+	return dot(ab,ab);
+}
+
+float Length2(float3 p)
+{
+	return dot(p, p);
+}
+
+#define LOOP_START \
+[unroll] \
+for (int k = -1; k <= 1; k++) \
+{ \
+[unroll] \
+for (int j = -1; j <= 1; j++) \
+{ \
+[unroll] \
+for (int i = -1; i <= 1; i++) \
+{ \
+
+#define LOOP_END \
+} } } \
+
+void ComputeDensityAndPressure(int id, float3 pi, out float density, out float pressure)
+{
+
+	float InvDensity = 1.0f / Density;
+	float MassMulInvDensity = ParticleMass * InvDensity;
+
+	density = ParticleMass * Poly6Zero;
+	pressure = 0;
+
+	float sum_grad_C2 = 0.0f;
+	float3 gradC_i = 0.0f;
+
+	int3 hashIndex = HashIndex(pi);
+	int3 size = HashSize;
+	int sizexy = size.x * size.y;
+
+	// 循环遍历临近位置
+	LOOP_START
+
+	// 计算索引
+	int xi = hashIndex.x + i;
+	int yj = hashIndex.y + j;
+	int zk = hashIndex.z + k;
+
+	// 限制范围，防止非法访问
+	if (xi < 0 || xi >= size.x) continue;
+	if (yj < 0 || yj >= size.y) continue;
+	if (zk < 0 || zk >= size.z) continue;
+
+	// 转换hash值，从表中获取约束，Table即hash.table
+	int hash = xi + yj * size.x + zk * sizexy;
+	int2 bounds = Table[hash];
+
+	// 从bounds.x 遍历到bounds.y, 考虑所有临近的粒子
+	for (int idx = bounds.x; idx <= bounds.y; idx++)
+	{
+		// 获取序号，跳过自己
+		int n = IndexMap[idx].y;
+		if (n == id) continue;
+
+		float dist2;	// 距离的平方
+		float3 diff;
+		float psi;
+		if (n < NumParticles)
+		{
+			// 相对距离
+			diff = pi - PredictedREAD[n].xyz;
+			dist2 = Length2(diff);
+		}
+		else
+		{
+			// 计算到容器粒子的情况，通过Boundary数据获取
+			int m = n - NumParticles;
+			float4 b = Boundary[m];
+			diff = pi - b.xyz;
+			psi = b.w;
+			dist2 = Length2(diff);
+		}
+
+		// 粒子相距过远，直接跳过
+		if (dist2 >= KernelRadius2) continue;
+
+		if (n < NumParticles)
+		{
+			density += ParticleMass * Poly6Kernel(dist2);
+			float3 gradC_j = -MassMulInvDensity * SpikyGradKernel(diff, dist2);
+			sum_grad_C2 += dot(gradC_j, gradC_j);
+			gradC_i -= gradC_j;
+		}
+		else
+		{
+			density += psi * Poly6Kernel(dist2);
+			float3 gradC_j = -psi * InvDensity * SpikyGradKernel(diff, dist2);
+			sum_grad_C2 += Length2(gradC_j);
+			gradC_i -= gradC_j;
+		}
+	}
+
+	LOOP_END
+
+	float C = density * InvDensity - 1.0f;
+
+	if (C > 0)
+	{
+		// C > 0 for 60% - 65% of particles
+		sum_grad_C2 += Length2(gradC_i);
+	
+		//If the fluid is collapsing you need to adjust e.
+		//Its a user specified relaxation parameter that 
+		//needs to be added to stabilze the pressure
+		//due to a vanishing gradient at the smoothing 
+		//kernel borders. The value may need to increase
+		//as the number of particles increase.
+		float e = 60.0f;
+		pressure = -C / (sum_grad_C2 + e);
+	}
+
+}
+
+#pragma kernel ComputeDensity
+
+[numthreads(THREADS, 1, 1)]
+void ComputeDensity(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		float3 pi = PredictedREAD[id].xyz;
+
+		float density, pressure;
+		ComputeDensityAndPressure(id, pi, density, pressure);
+
+		Densities[id] = density;
+		Pressures[id] = pressure;
+
+	}
+}
+
+float3 SolveDensity(int id, float3 pi, float pressure)
+{
+
+	float3 corr = 0;
+	float InvDensity = 1.0f / Density;
+	float MassMulInvDensity = ParticleMass * InvDensity;
+
+	int3 hashIndex = HashIndex(pi);
+	int3 size = HashSize;
+	int sizexy = size.x * size.y;
+
+	LOOP_START
+
+	int xi = hashIndex.x + i;
+	int yj = hashIndex.y + j;
+	int zk = hashIndex.z + k;
+
+	if (xi < 0 || xi >= size.x) continue;
+	if (yj < 0 || yj >= size.y) continue;
+	if (zk < 0 || zk >= size.z) continue;
+
+	int hash = xi + yj * size.x + zk * sizexy;
+	int2 bounds = Table[hash];
+
+	for (int idx = bounds.x; idx <= bounds.y; idx++)
+	{
+		int n = IndexMap[idx].y;
+		if (n == id) continue;
+
+		float dist2;
+		float3 diff;
+		float psi;
+		if (n < NumParticles)
+		{
+			diff = pi - PredictedREAD[n].xyz;
+			dist2 = Length2(diff);
+		}
+		else
+		{
+			int m = n - NumParticles;
+			float4 b = Boundary[m];
+			diff = pi - b.xyz;
+			psi = b.w;
+			dist2 = Length2(diff);
+		}
+
+		if (dist2 >= KernelRadius2) continue;
+
+		if (n < NumParticles)
+		{
+			float3 gradW = SpikyGradKernel(diff, dist2);
+			corr -= (pressure + Pressures[n]) * -MassMulInvDensity * gradW;
+		}
+		else
+		{
+			float3 gradW = SpikyGradKernel(diff, dist2);
+			corr -= pressure * -psi * InvDensity * gradW;
+		}
+	}
+
+	LOOP_END
+
+	return corr;
+}
+
+#pragma kernel SolveConstraint
+
+[numthreads(THREADS, 1, 1)]
+void SolveConstraint(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		float3 pi = PredictedREAD[id].xyz;
+		float pressure = Pressures[id];
+
+		pi += SolveDensity(id, pi, pressure);
+
+		PredictedWRITE[id] = float4(pi, 0);
+	}
+}
+
+#pragma kernel UpdateVelocities
+
+[numthreads(THREADS, 1, 1)]
+void UpdateVelocities(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		float4 p = Positions[id];
+		float4 pi = PredictedREAD[id];
+
+		float4 velocity = (pi - p) / DeltaTime;
+
+		VelocitiesWRITE[id] = velocity;
+	}
+}
+
+float3 ComputeViscosity(int id, float3 pi)
+{
+
+	float viscosityMulMass = Viscosity * ParticleMass;
+
+	int3 hashIndex = HashIndex(pi);
+	int3 size = HashSize;
+	float sizexy = size.x * size.y;
+
+	float3 velocity = VelocitiesREAD[id].xyz;
+
+	LOOP_START
+
+	int xi = hashIndex.x + i;
+	int yj = hashIndex.y + j;
+	int zk = hashIndex.z + k;
+
+	if (xi < 0 || xi >= size.x) continue;
+	if (yj < 0 || yj >= size.y) continue;
+	if (zk < 0 || zk >= size.z) continue;
+
+	int hash = xi + yj * size.x + zk * sizexy;
+	int2 bounds = Table[hash];
+
+	for (int idx = bounds.x; idx <= bounds.y; idx++)
+	{
+		int n = IndexMap[idx].y;
+		if (n == id || n >= NumParticles) continue;
+
+		float3 pn = PredictedREAD[n].xyz;
+		float dist2 = Distance2(pi, pn);
+		if (dist2 >= KernelRadius2) continue;
+
+		float invDensity = 1.0f / Densities[n];
+		float v = ViscLapKernel(dist2) * viscosityMulMass * invDensity;
+		velocity -= v * (velocity - VelocitiesREAD[n].xyz);
+	}
+
+	LOOP_END
+
+	return velocity;
+
+}
+
+#pragma kernel SolveViscosity
+
+[numthreads(THREADS, 1, 1)]
+void SolveViscosity(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		float3 pi = PredictedREAD[id].xyz;
+
+		float3 velocity = ComputeViscosity(id, pi);
+
+		VelocitiesWRITE[id] = float4(velocity,0);
+	}
+}
+
+#pragma kernel UpdatePositions
+
+[numthreads(THREADS, 1, 1)]
+void UpdatePositions(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		Positions[id].xyz = PredictedREAD[id].xyz;
+	}
+}
+
+#pragma kernel ApplyExternalForces
+
+[numthreads(THREADS,1,1)]
+void ApplyExternalForces(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+
+	}
+}
+
+#pragma kernel EstimatePositions
+
+[numthreads(THREADS,1,1)]
+void EstimatePositions(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		float3 velocity = Velocity(id);
+		float3 predicted = PredictedPosition(id, velocity);
+
+		VelocitiesWRITE[id] = float4(velocity, 0);
+		PredictedWRITE[id].xyz = predicted.xyz;
+	}
+}
+
+float3 SolveCollision(int id, float3 pi)
+{
+	float3 corr = 0;
+	float InvDensity = 1.0f / Density;
+	float MassMulInvDensity = ParticleMass * InvDensity;
+
+	int3 hashIndex = HashIndex(pi);
+	int3 size = HashSize;
+	int sizexy = size.x * size.y;
+
+	LOOP_START
+
+	int xi = hashIndex.x + i;
+	int yj = hashIndex.y + j;
+	int zk = hashIndex.z + k;
+
+	if (xi < 0 || xi >= size.x) continue;
+	if (yj < 0 || yj >= size.y) continue;
+	if (zk < 0 || zk >= size.z) continue;
+
+	int hash = xi + yj * size.x + zk * sizexy;
+	int2 bounds = Table[hash];
+
+	for (int idx = bounds.x; idx <= bounds.y; idx++)
+	{
+		int n = IndexMap[idx].y;
+		if (n == id) continue;
+
+		float dist2;
+		float3 diff;
+		float psi;
+		if (n < NumParticles)
+		{
+			diff = pi - PredictedREAD[n].xyz;
+			dist2 = Length2(diff);
+		}
+		else if (n < NumParticles + BoundaryParticles)
+		{
+			int m = n - NumParticles;
+			float4 b = Boundary[m];
+			diff = pi - b.xyz;
+			psi = b.w;
+			dist2 = Length2(diff);
+		}
+		else
+		{
+			int m = n - NumParticles - BoundaryParticles;
+			float4 b = Extra[m];
+			diff = pi - b.xyz;
+			psi = b.w;
+			dist2 = Length2(diff);
+		}
+
+		if (dist2 >= ParticleRadius * ParticleRadius * 4) continue;
+
+		// 检测到碰撞发生
+		if (n < NumParticles)
+		{
+			//float4 b = PredictedREAD[n];
+			//diff = pi - b.xyz;
+
+			//float3 tar = Vec2Norm(diff) * KernelRadius * 0.9 + b.xyz;
+			//corr += tar - pi;
+		}
+		else if (n < NumParticles + BoundaryParticles)
+		{
+			//float3 gradW = SpikyGradKernel(diff, dist2);
+			//corr -= pressure * -psi * InvDensity * gradW;
+
+			int m = n - NumParticles;
+			float4 b = Boundary[m];
+			diff = pi - b.xyz;
+
+			//float3 tar = Vec2Norm(diff) * KernelRadius * 0.9 + b.xyz;
+			float3 tar = float3(0, 1, 0) * KernelRadius * 0.95 + b.xyz;
+			corr += tar - pi;
+			VelocitiesWRITE[id] = float4(0, 0, 0, 0);
+		}
+		else
+		{
+			int m = n - NumParticles - BoundaryParticles;
+			float4 b = Extra[m];
+			diff = pi - b.xyz;
+
+			float3 tar = Vec2Norm(diff) * KernelRadius * 0.9 + b.xyz;
+			corr += tar - pi;
+			VelocitiesWRITE[id].xyz += (tar - pi).xyz * 600;
+		}
+	}
+
+	LOOP_END
+
+	return corr;
+}
+
+#pragma kernel ResolveCollisions
+
+[numthreads(THREADS,1,1)]
+void ResolveCollisions(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles)
+	{
+		float3 pi = PredictedREAD[id].xyz;
+
+		pi += SolveCollision(id, pi);
+
+		PredictedWRITE[id].xyz = pi.xyz;
+	}
+}
+
+
+
+float3 ComputeNewCore()
+{
+	float3 tmp = float3(0, 0, 0);
+	for (int id = 0; id < NumParticles; id++)
+	{
+		tmp += PredictedREAD[id].xyz ;
+	}
+	return tmp / NumParticles;
+}
+
+float3 ComputeOldCore()
+{
+	float3 tmp = float3(0, 0, 0);
+	for (int id = 0; id < NumParticles; id++)
+	{
+		tmp += Positions[id].xyz ;
+	}
+	return tmp / NumParticles;
+}
+
+
+float3x3 EigenJacobiMethod(inout float3x3 a, inout float3x3 v)
+{
+	int n = 3;
+	float3 bim = {0, 0, 0};
+	float3 bjm = {0, 0, 0};
+	float bii, bij, bjj, bji;
+
+	float eps = 1e-8;
+	int iter_max = 100;
+
+	for(int i=0; i< n; i++){
+		for(int j=0; j< n; j++){
+			if(i == j) v[i][j] = 1.0;
+			else v[i][j] = 0.0;
+			//v[i][j] = (i == j) ? 1.0 : 00;
+		}
+	}
+
+	int cnt = 0;
+
+	for(;;){
+		int i = -1, j = -1;
+
+		float x = 0.0;
+		for(int ia = 0; ia < n; ia ++){
+			for(int ja = 0; ja < n; ja ++){
+				if(ia != ja && abs(a[ia][ja]) > x){
+					i = ia;
+					j = ja;
+					x = abs(a[ia][ja]);
+				}
+			}
+		}
+
+		if (i == -1 || j == -1) return v;
+
+		float aii = a[i][i];
+		float ajj = a[j][j];
+		float aij = a[i][j];
+
+		float m_fAlpha, m_fBeta;
+		m_fAlpha = (aii - ajj) / 2.0;
+		m_fBeta = sqrt(m_fAlpha * m_fAlpha + aij * aij);
+
+		float st, ct;
+		ct = sqrt((1.0 + abs(m_fAlpha) / m_fBeta) / 2.0);
+		st = (((aii - ajj) >= 0.0) ? 1.0 : -1.0) * aij / (2.0 * m_fBeta * ct);
+
+		for(int m = 0; m < n; m++){
+			if(m == i || m == j) continue;
+
+			float aim = a[i][m];
+			float ajm = a[j][m];
+
+			if(m == 0){
+				bim.x = aim * ct + ajm * st;
+				bjm.x = -aim * st + ajm * ct;
+			}
+			else if(m == 1){
+				bim.y = aim * ct + ajm * st;
+				bjm.y = -aim * st + ajm * ct;
+			}
+			else{
+				bim.z = aim * ct + ajm * st;
+				bjm.z = -aim * st + ajm * ct;
+			}
+		}
+
+		bii = aii * ct * ct + 2.0 * aij * ct * st + ajj * st * st;
+		bij = 0.0;
+
+		bjj = aii * st * st - 2.0 * aij * ct * st + ajj * ct * ct;
+		bji = 0.0;
+
+		for(int m = 0; m < n; m++){
+			if(m == 0){
+				//若不使用条件进行约束，会导致编译错误，尚未有更好的解决方案
+				if(i == 0){
+					a[i][m] = a[m][i] = bim.x;
+				}
+				else if (i == 1){
+					a[i][m] = a[m][i] = bim.x;
+				}
+				else if (i == 2){
+					a[i][m] = a[m][i] = bim.x;
+				}
+				if(j == 0){
+					a[j][m] = a[m][j] = bjm.x;
+				}
+				else if (j == 1){
+					a[j][m] = a[m][j] = bjm.x;
+				}
+				else if (j == 2){
+					a[j][m] = a[m][j] = bjm.x;
+				}
+			}
+			else if(m == 1){
+				if(i == 0){
+					a[i][m] = a[m][i] = bim.y;
+				}
+				else if (i == 1){
+					a[i][m] = a[m][i] = bim.y;
+				}
+				else if (i == 2){
+					a[i][m] = a[m][i] = bim.y;
+				}
+				if(j == 0){
+					a[j][m] = a[m][j] = bjm.y;
+				}
+				else if (j == 1){
+					a[j][m] = a[m][j] = bjm.y;
+				}
+				else if (j == 2){
+					a[j][m] = a[m][j] = bjm.y;
+				}
+			}
+			else if(m == 2){
+				if(i == 0){
+					a[i][m] = a[m][i] = bim.z;
+				}
+				else if (i == 1){
+					a[i][m] = a[m][i] = bim.z;
+				}
+				else if (i == 2){
+					a[i][m] = a[m][i] = bim.z;
+				}
+				if(j == 0){
+					a[j][m] = a[m][j] = bjm.z;
+				}
+				else if (j == 1){
+					a[j][m] = a[m][j] = bjm.z;
+				}
+				else if (j == 2){
+					a[j][m] = a[m][j] = bjm.z;
+				}
+			}
+		}
+
+		if (i == 0){
+			if (j == 0){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;
+			}
+			else if (j == 1){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;
+			}
+			else if (j == 2){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;		
+			}
+		
+		}
+		else if (i == 1){
+			if (j == 0){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;
+			}
+			else if (j == 1){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;
+			}
+			else if (j == 2){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;		
+			}		
+		}
+		else if (i == 2){
+			if (j == 0){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;
+			}
+			else if (j == 1){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;
+			}
+			else if (j == 2){
+				a[i][i] = bii;
+				a[i][j] = bij;
+				a[j][j] = bjj;
+				a[j][i] = bji;		
+			}		
+		}
+
+		// V = PV
+		for(int m = 0; m < n; m++){
+			float vmi = v[m][i];
+			float vmj = v[m][j];
+
+			if(m == 0){
+				bim.x = vmi * ct + vmj * st;
+				bjm.x = -vmi * st + vmj * ct;
+			}
+			else if(m == 1){
+				bim.y = vmi * ct + vmj * st;
+				bjm.y = -vmi * st + vmj * ct;
+			}
+			else{
+				bim.z = vmi * ct + vmj * st;
+				bjm.z = -vmi * st + vmj * ct;
+			}
+		}
+
+		for(int m = 0; m < n; m++){
+			if(m == 0){
+				//若不使用条件进行约束，会导致编译错误，尚未有更好的解决方案
+				if(i == 0){
+					v[m][i] = bim.x;
+				}
+				else if (i == 1){
+					v[m][i] = bim.x;
+				}
+				else if (i == 2){
+					v[m][i] = bim.x;
+				}
+				if(j == 0){
+					v[m][j] = bjm.x;
+				}
+				else if (j == 1){
+					v[m][j] = bjm.x;
+				}
+				else if (j == 2){
+					v[m][j] = bjm.x;
+				}
+			}
+			else if(m == 1){
+				if(i == 0){
+					v[m][i] = bim.y;
+				}
+				else if (i == 1){
+					v[m][i] = bim.y;
+				}
+				else if (i == 2){
+					v[m][i] = bim.y;
+				}
+				if(j == 0){
+					v[m][j] = bjm.y;
+				}
+				else if (j == 1){
+					v[m][j] = bjm.y;
+				}
+				else if (j == 2){
+					v[m][j] = bjm.y;
+				}
+			}
+			else if (m == 2){
+				if(i == 0){
+					v[m][i] = bim.z;
+				}
+				else if (i == 1){
+					v[m][i] = bim.z;
+				}
+				else if (i == 2){
+					v[m][i] = bim.z;
+				}
+				if(j == 0){
+					v[m][j] = bjm.z;
+				}
+				else if (j == 1){
+					v[m][j] = bjm.z;
+				}
+				else if (j == 2){
+					v[m][j] = bjm.z;
+				}
+			}
+		}
+
+		float e = 0.0;
+		for(int ja = 0; ja < n; ja++){
+			for(int ia = 0; ia < n; ia ++){
+				if(ia != ja){
+					e = e + abs(a[ja][ia]);
+				}
+			}
+		}
+
+		if (e < eps) break;
+
+		cnt ++;
+		if (cnt > iter_max) break;
+	}
+
+	return v;
+}
+
+
+float3x3 PolarDecomposition(in float3x3 A, inout float3x3 R, inout float3x3 S)
+{
+	
+	float3x3 ATA = Matrix3x3Mul(transpose(A), A);
+	float3x3 U;
+
+	U = EigenJacobiMethod(ATA, U);
+
+	float l0 = (ATA[0][0] <= 0.0) ? 0.0 : 1.0 / sqrt(ATA[0][0]);
+	float l1 = (ATA[1][1] <= 0.0) ? 0.0 : 1.0 / sqrt(ATA[1][1]);
+	float l2 = (ATA[2][2] <= 0.0) ? 0.0 : 1.0 / sqrt(ATA[2][2]);
+
+	float3x3 S1;
+	S1[0][0] = l0 * U[0][0] * U[0][0] + l1 * U[0][1] * U[0][1] + l2 * U[0][2] * U[0][2];
+	S1[0][1] = l0 * U[0][0] * U[1][0] + l1 * U[0][1] * U[1][1] + l2 * U[0][2] * U[1][2];
+	S1[0][2] = l0 * U[0][0] * U[2][0] + l1 * U[0][1] * U[2][1] + l2 * U[0][2] * U[2][2];
+
+	S1[1][0] = S1[0][1];
+	S1[1][1] = l0 * U[1][0] * U[1][0] + l1 * U[1][1] * U[1][1] + l2 * U[1][2] * U[1][2];
+	S1[1][2] = l0 * U[1][0] * U[2][0] + l1 * U[1][1] * U[2][1] + l2 * U[1][2] * U[2][2];
+
+	S1[2][0] = S1[0][2];
+	S1[2][1] = S1[1][2];
+	S1[2][2] = l0 * U[2][0] * U[2][0] + l1 * U[2][1] * U[2][1] + l2 * U[2][2] * U[2][2];
+
+	R = Matrix3x3Mul(A, S1);
+	S = Matrix3x3Mul(transpose(R), A);
+
+	return R;
+}
+
+
+#pragma kernel ShapeMatching
+
+[numthreads(THREADS,1,1)]
+void ShapeMatching(int id : SV_DispatchThreadID)
+{
+	//m_fAlpha = 0.9;	
+	//m_fBeta = 0.9;
+
+	if (id < NumParticles){
+		float3 newCore = ComputeNewCore();
+		float3 oldCore = ComputeOldCore();
+		float3x3 Apq = {
+			0, 0, 0,
+			0, 0, 0,
+			0, 0, 0
+		};
+		float3x3 Aqq = {
+			0, 0, 0,
+			0, 0, 0,
+			0, 0, 0
+		};
+		
+		for(int i =0; i < NumParticles; i++){
+			float3 p = PredictedREAD[i].xyz - newCore;
+			float3 q = Positions[i].xyz - oldCore;
+			float m = 1.0;
+			//Apq += mul(new_r, old_r);
+			//Aqq += mul(old_r, old_r);
+			Apq[0][0] += m*p[0]*q[0];
+			Apq[0][1] += m*p[0]*q[1];
+			Apq[0][2] += m*p[0]*q[2];
+			Apq[1][0] += m*p[1]*q[0];
+			Apq[1][1] += m*p[1]*q[1];
+			Apq[1][2] += m*p[1]*q[2];
+			Apq[2][0] += m*p[2]*q[0];
+			Apq[2][1] += m*p[2]*q[1];
+			Apq[2][2] += m*p[2]*q[2];
+ 
+			Aqq[0][0] += m*q[0]*q[0];
+			Aqq[0][1] += m*q[0]*q[1];
+			Aqq[0][2] += m*q[0]*q[2];
+			Aqq[1][0] += m*q[1]*q[0];
+			Aqq[1][1] += m*q[1]*q[1];
+			Aqq[1][2] += m*q[1]*q[2];
+			Aqq[2][0] += m*q[2]*q[0];
+			Aqq[2][1] += m*q[2]*q[1];
+			Aqq[2][2] += m*q[2]*q[2];
+		}
+
+		float3x3 R = {
+			0, 0, 0,
+			0, 0, 0,
+			0, 0, 0
+		};
+		float3x3 S = {
+			0, 0, 0,
+			0, 0, 0,
+			0, 0, 0
+		};
+		R = PolarDecomposition(Apq, R, S);
+
+		//float3x3 A = {
+		//	0, 0, 0,
+		//	0, 0, 0,
+		//	0, 0, 0
+		//};
+
+		//A = mul(Apq * inverse(Aqq));
+
+		//rxMatrix3 RL = m_fBeta * A + (1.0 - m_fBeta) * R;
+
+
+		float3 g = Matrix3x3MulFloat3(R, (Positions[id].xyz - oldCore)) + newCore;
+
+		//float3x3 T = {
+		//	1, 2, 3,
+		//	0, 0, 0,
+		//	0, 0, 0
+		//};
+
+		//float3x3 T2 = mul((T), T);
+		//float3x3 MT2 = Matrix3x3Mul(T,T) - T2;
+
+		PredictedWRITE[id].xyz = g.xyz;
+	}
+}
+
+#pragma kernel MoveTowardsKey
+
+[numthreads(THREADS,1,1)]
+void MoveTowardsKey(int id : SV_DispatchThreadID)
+{
+	if (id < NumParticles){
+		float3 p = Positions[id].xyz;
+		float psi = Positions[id].w;
+		p += dxyz;
+
+		Positions[id] = float4(p, psi);
+	}
+}
