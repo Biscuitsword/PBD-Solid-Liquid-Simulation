@@ -1,7 +1,7 @@
 # PBD-Solid-Liquid-Simulation
 Simulating the physical effects of solid-liquid coupling based on the project https://github.com/Scrawk/PBD-Fluid-in-Unity
 
-本项目基于 https://github.com/Scrawk/PBD-Fluid-in-Unity项目中的流体系统，实现了基于PBD算法的固液双向耦合系统。
+本项目基于 https://github.com/Scrawk/PBD-Fluid-in-Unity 项目中的流体系统，实现了基于PBD算法的固液双向耦合系统。
 
 受Scrawk项目启发，基于Unity中的ComputeShader，实现了在GPU上的运算。
 
