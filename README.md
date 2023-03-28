@@ -7,7 +7,7 @@ Simulating the physical effects of solid-liquid coupling based on the project ht
 
 实现效果：
 
-1. 固体对液体的单向作用：通过操作移动刚体，能够推动或截断水流![单向](https://github.com/Biscuitsword/PBD-Solid-Liquid-Simulation/tree/main/Demonstration/单向.png)
+1. 固体对液体的单向作用：通过操作移动刚体，能够推动或截断水流![单向](https://github.com/Biscuitsword/PBD-Solid-Liquid-Simulation/blob/main/Demonstration/%E5%8D%95%E5%90%91.png)
 2. 固液双向耦合作用：将刚体抛入水中，溅起水花且刚体在水面沉浮![双向](D:\大四上\课程设计\PBD-Solid-Liquid-Simulation\Demonstration\双向.png)
 
 
